@@ -1,0 +1,528 @@
+#!/usr/bin/env ruby -W0
+# frozen_string_literal: true
+#
+# Copyright (c) 2021-2022 Akinori MUSHA
+#
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.	 IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+#
+# The primary usage of this script is the following:
+#
+#   ical_events eventsInMintues:30
+#   ical_events --open-urls eventsInMintues:5
+#   ical_events --open-urls eventsNow
+#
+
+RUBY_VERSION >= '3.0' or abort "Ruby 3.0 or later is required."
+
+require 'json'
+require 'time'
+require 'uri'
+require 'yaml'
+
+CONFIG_FILE = File.expand_path("~/.config/ical_events.yaml")
+
+RE_URL = %r{\bhttps?://[^"<>\s]+}
+
+BULLET = "\u2022"
+
+TIME_FORMAT = "%Y/%m/%d %H:%M %z"
+
+def load_configuration(file = CONFIG_FILE)
+  if File.exist?(file)
+    YAML.load_file(file, symbolize_names: true)
+  else
+    {}
+  end
+end
+
+def edit_configuration(file = CONFIG_FILE)
+  if !File.exist?(file)
+    require "fileutils"
+    FileUtils.mkdir_p(File.dirname(file))
+    File.write(file, <<-'EOF')
+# Calendars to check
+calendars:
+# - Personal
+# - type: regexp
+#   pattern: "^(?i:me@)"
+urls:
+  # URLs to ignore
+  ignore:
+    # Example: Ignore URLs of developer only meetings because I'm not a developer.
+    # - calendar: me@my.compan.y
+    #   title:
+    #     type: regexp
+    #     pattern: "(?i:Developers Only)"
+    # Example: Do not open Google Meet URLs because we don't use Google Meet in this community.
+    # - calendar: me@my.communit.y
+    #   url:
+    #     type: regexp
+    #     pattern: "https://meet\\.google\\.com/"
+  account:
+    # Open Google URLs with an authuser parameter.
+    google:
+      # Example: Open Google Links as their respective organization selves.
+      # me@my.compan.y:
+      #   - calendar: me@my.compan.y
+      # me@my.communit.y:
+      #   - calendar: me@my.communit.y
+    zoom:
+    # Open Zoom URLs using a specific name.
+      # Example: Include my company name when joining a Zoom meeting with external attendees.
+      # "Me (My Company)":
+      #   - calendar: me@my.compan.y
+      #     attendee:
+      #       type: regexp
+      #       pattern: "\\S@(?=\\S)(?~@my\\.compan\\.y)$"
+    EOF
+  end
+
+  system(
+    ENV.fetch("EDITOR") { "/usr/bin/vi" },
+    file
+  )
+end
+
+def configuration
+  @configuration ||= load_configuration()
+end
+
+def pattern_to_regexp(value)
+  case value
+  in nil
+    //
+  in String
+    /\A#{Regexp.quote(value)}\z/
+  in { type: "regexp", pattern: }
+    Regexp.new(pattern)
+  in { type: }
+    raise "Unsupported type: #{type}"
+  else
+    raise "Unsupported pattern: #{value.inspect}"
+  end
+end
+
+def compile_event_pattern(hash)
+  hash.transform_values { |value|
+    pattern_to_regexp(value)
+  }
+end
+
+class Calendar < Struct.new(
+  :title,
+  :type,
+  :uid,
+  keyword_init: true
+)
+  def to_json(*a)
+    to_h.to_json(*a)
+  end
+end
+
+class Event < Struct.new(
+  :title,
+  :calendar,
+  :start_at,
+  :start_on,
+  :end_at,
+  :end_on,
+  :attendees,
+  :location,
+  :notes,
+  :url,
+  :urls,
+  keyword_init: true
+)
+  def start_in_range?(range)
+    if start_at
+      range.cover?(start_at)
+    else
+      false
+    end
+  end
+
+  def to_json(*a)
+    to_h.transform_values! { |v|
+      case v
+      when Time, Date
+        v.iso8601
+      else
+        v
+      end
+    }.to_json(*a)
+  end
+end
+
+def event_match?(event, hash)
+  if hash in { calendar: }
+    calendar === event.calendar or return false
+  end
+
+  if hash in { title: }
+    title === event.title or return false
+  end
+
+  if hash in { notes: }
+    title === event.notes or return false
+  end
+
+  if hash in { url: }
+    event.urls.any?(url) or return false
+  end
+
+  if hash in { attendee: }
+    Array(event.attendees).any?(attendee) or return false
+  end
+
+  true
+end
+
+def get_calendars
+  IO.popen(%W[icalBuddy calendars]) do |io|
+    calendars = []
+    calendar = nil
+
+    io.each_line(chomp: true) { |line|
+      case line
+      when /\A#{BULLET} \K(.+)/o
+        calendar = Calendar.new(title: $1)
+        calendars << calendar
+      when /\A  type: \K(.+)/
+        calendar.type = $1
+      when /\A  UID: \K(.+)/
+        calendar.uid = $1
+      end
+    }
+
+    calendars
+  end
+end
+
+def get_events(calendars, argv, &event_in_range_p)
+  events = []
+
+  IO.popen(
+    %W[
+      icalBuddy -ic #{calendars.map(&:uid).join(',')} -nrd -df %Y-%m-%d -tf %Y-%m-%dT%H:%M:%S%z
+    ] + argv
+  ) do |io|
+    event = nil
+    last_prop = nil
+
+    io.each_line(chomp: true) do |line|
+      case line
+      when /\A#{Regexp.quote(BULLET)} (.+) \((#{Regexp.union(calendars.map(&:title))})\)\z/o
+        events << event if event && event_in_range_p.call(event)
+        event = Event.new(title: $1, calendar: $2)
+      when /\A    (\w+): (.+)/
+        last_prop = $1.to_sym
+        event[last_prop] = $2
+      when /\A    ( .+)/
+        event[last_prop] << "\n" << $1.delete_prefix(' ' * (last_prop.size + 2))
+      when /\A    (\d{4}-\d{2}-\d{2}.*)/
+        start_at, end_at = $1.split(' - ').map { |timespec|
+          case timespec
+          when /(\d{4}-\d{2}-\d{2}T\S+)/
+            Time.parse($1)
+          when /(\d{4}-\d{2}-\d{2})/
+            Date.parse($1)
+          end
+        }
+        end_at ||= start_at
+
+        case start_at
+        when Date
+          event[:start_on] = start_at
+        when Time
+          event[:start_at] = start_at
+          event[:start_on] = start_at.to_date
+        else
+          $stderr.puts "invalid date/time range: #{line}"
+        end
+
+        case end_at
+        when Date
+          event[:end_on] = end_at
+        when Time
+          event[:end_at] = end_at
+          event[:end_on] = end_at.to_date
+        else
+          $stderr.puts "invalid date/time range: #{line}"
+        end
+      end
+    end
+    events << event if event && event_in_range_p.call(event)
+  end
+
+  events
+end
+
+def main
+  verbose = false
+  start_at_range = nil
+  open_urls = false
+
+  myname = File.basename($0)
+
+  Process.wait2(spawn("type icalBuddy", err: IO::NULL, out: IO::NULL))[1].success? or
+    abort "#{myname}: icalBuddy must be installed.  To install it via Homebrew, run `brew install ical-buddy`."
+
+  until ARGV.empty?
+    if ARGV.delete("-V")
+      system("icalBuddy -V")
+      exit
+    end
+
+    # JSON is our output format and fancy output breaks parsing.
+    ARGV.delete("-f")
+
+    case ARGV.first
+    when '--edit-config'
+      edit_configuration
+      exit
+    when '--help'
+      print IO.popen("icalBuddy --help", &:read)
+        .sub!(/^USAGE: \KicalBuddy/, myname)
+        .sub!(/^<command>.*$/) { $& + " (default: eventsNow)" }
+        .sub!(/^( +'eventsNow'\s+.*\n)/) { $& + <<-EOS }
+  'eventsInMinutes:NUM'
+                     Print events occurring in N minutes (#{myname} feature)
+        EOS
+        .sub!(/^Some .*\n/, <<-EOS)
+ical_events specific [options] must come first:
+
+--edit-config
+            Edit the configuration file, creating one if not
+--open-urls Open URLs in matching events via open(1)
+--verbose   Print additional information to stderr
+
+followed by icalBuddy options:
+        EOS
+        .sub!(/^-[A-Za-z].*\n(?=\n)/) { $& + <<-EOS }
+
+#{myname} prints out events in JSON, so among others, formatting options do not work with ical_events.
+        EOS
+      exit
+    when '--open-urls'
+      open_urls = true
+    when '--verbose'
+      verbose = true
+    when 'calendars'
+      puts JSON.pretty_generate(get_calendars)
+      exit
+    else
+      break
+    end
+
+    ARGV.shift
+  end
+
+  argv =
+    if ARGV.empty?
+      %w[eventsNow]
+    else
+      ARGV.flat_map { |arg|
+        case arg
+        when /\AeventsInMinutes:(-?\d+)\z/
+          now = Time.now
+          minutes = $1.to_i
+          from, to = [now, now + minutes * 60].sort
+          start_at_range = from...to
+          [
+            "eventsFrom:" + from.strftime(TIME_FORMAT),
+            "to:" + to.strftime(TIME_FORMAT),
+          ]
+        else
+          arg
+        end
+      }
+    end
+
+  urls_ignore = Array(configuration.dig(:urls, :ignore)).map { |hash|
+    compile_event_pattern(hash)
+  }
+
+  urls_account = configuration.dig(:urls, :account)&.then { |account_hash|
+    account_hash.transform_values { |account_to_patterns|
+      account_to_patterns.to_h { |account, patterns|
+        [
+          account.to_s,
+          patterns.map { |hash|
+            compile_event_pattern(hash)
+          }
+        ]
+      }
+    }
+  } || {}
+
+  re_calendar_name =
+    if (patterns = Array(configuration.dig(:calendars))).size > 0
+      patterns.map { |pattern|
+        pattern_to_regexp(pattern)
+      }.then { |res| Regexp.union(*res) }
+    else
+      //
+    end
+
+  calendars = get_calendars.select { |calendar|
+    re_calendar_name.match?(calendar.title)
+  }
+
+  if verbose
+    $stderr.puts "Checking #{calendars.size} calendars:"
+    calendars.each do |calendar|
+      $stderr.puts "- #{calendar.title}"
+    end
+  end
+
+  events = get_events(calendars, argv) { |event|
+    if start_at_range
+      event.start_in_range?(start_at_range)
+    else
+      true
+    end
+  }
+
+  account_for_event = -> (event, account_type) {
+    urls_account[account_type]&.each_pair do |account, patterns|
+      if patterns.any? { |pattern| event_match?(event, pattern) }
+        return account
+      end
+    end
+
+    nil
+  }
+
+  events.each do |event|
+    event[:attendees] &&= event[:attendees].split(', ')
+
+    urls = [
+      *event[:url]&.scan(RE_URL),
+      *event[:location]&.scan(RE_URL),
+      *event[:notes]&.scan(RE_URL),
+    ].reject { |url|
+      urls_ignore.any? { |hash|
+        case hash
+        in { url: url_pattern, **rest }
+          url_pattern === url && event_match?(event, rest)
+        else
+          event_match?(event, hash)
+        end
+      }
+    }
+
+    meeting_uris, other_uris = urls.map { |url| URI(url) }.group_by { |uri|
+      case uri.host
+      when /(?:\A|\.)zoom\.us\z/
+        :meeting
+      when 'meet.google.com'
+        :meeting
+      when 'tel.meet'
+        nil
+      when 'www.getclockwise.com'
+        nil
+      when 'whereby.com'
+        :meeting
+      else
+        :other
+      end
+    }.values_at(:meeting, :other).map { |uris|
+      Array(uris).map { |uri|
+        case uri.host
+        when /\.google\.com\z/
+          if account = account_for_event.call(event, :google)
+            uri + "?#{uri.query&.+ "&"}#{URI.encode_www_form(authuser: account)}"
+          else
+            uri
+          end
+        when /(?:\A|\.)zoom\.us\z/
+          case uri.path
+          when %r{\A/j/(\d+)\z}
+            confno = $1
+            if username = account_for_event.call(event, :zoom)
+              URI("zoommtg://zoom.us/join?#{URI.encode_www_form(confno: confno, uname: username)}&#{uri.query}")
+            else
+              uri
+            end
+          when %r{\A/s/(\d+)\z}
+            confno = $1
+            if username = account_for_event.call(event, :zoom)
+              URI("zoommtg://zoom.us/start?#{URI.encode_www_form(confno: confno, uname: username)}&#{uri.query}")
+            else
+              uri
+            end
+          else
+            uri
+          end
+        else
+          uri
+        end
+      }
+    }
+
+    meeting_uri = meeting_uris.max_by { |uri|
+      case uri.host
+      when /(?:\A|\.)zoom\.us\z/
+        case uri.path
+        when %r{\A/(?:j|s|(?:wc/)?(?:join|start))(?:/|\z)}
+          if /pwd=/.match?(uri.query)
+            10
+          else
+            9
+          end
+        else
+          1
+        end
+      when 'meet.google.com'
+        case uri.path
+        when %r{\A/[a-z]{3,}(?:-[a-z]{3,}){2,}\z}
+          9
+        else
+          1
+        end
+      when 'whereby.com'
+        case uri.path
+        when %r{\A/[^/]+\z}
+          9
+        else
+          1
+        end
+      else
+        0
+      end
+    }
+
+    event[:urls] = [*meeting_uri, *other_uris].uniq.map(&:to_s)
+  end
+
+  if open_urls
+    events.flat_map { |event| event[:urls] }.each do |url|
+      system 'open', '-g', url
+    end
+  end
+
+  puts JSON.pretty_generate(events)
+end
+
+main
