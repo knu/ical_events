@@ -444,6 +444,14 @@ followed by icalBuddy options:
         nil
       when 'whereby.com'
         :meeting
+      when /\.slack\.com\z/
+        case uri.path
+        when %r{\A/team/}
+          # Slack @user/@team mentions
+          nil
+        else
+          :other
+        end
       else
         :other
       end
