@@ -183,6 +183,10 @@ def event_match?(event, hash)
     title === event.title or return false
   end
 
+  if hash in { location: }
+    location === event.location or return false
+  end
+
   if hash in { notes: }
     title === event.notes or return false
   end
