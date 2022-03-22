@@ -65,7 +65,8 @@ def edit_configuration(file = CONFIG_FILE)
 calendars:
 # - Personal
 # - type: regexp
-#   pattern: "^(?i:me@)"
+#   pattern: |-
+#     ^(?i:me@)
 urls:
   # URLs to ignore
   ignore:
@@ -73,12 +74,14 @@ urls:
     # - calendar: me@my.compan.y
     #   title:
     #     type: regexp
-    #     pattern: "(?i:Developers Only)"
+    #     pattern: |-
+    #       (?i:Developers Only)
     # Example: Do not open Google Meet URLs because we don't use Google Meet in this community.
     # - calendar: me@my.communit.y
     #   url:
     #     type: regexp
-    #     pattern: "https://meet\\.google\\.com/"
+    #     pattern: |-
+    #       ^https://meet\.google\.com/
   account:
     # Open Google URLs with an authuser parameter.
     google:
@@ -94,7 +97,8 @@ urls:
       #   - calendar: me@my.compan.y
       #     attendee:
       #       type: regexp
-      #       pattern: "\\S@(?=\\S)(?~@my\\.compan\\.y)$"
+      #       pattern: |-
+      #         \S@(?=\S)(?~@my\.compan\.y)$
     EOF
   end
 
