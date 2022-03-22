@@ -36,6 +36,7 @@
 RUBY_VERSION >= '3.0' or abort "Ruby 3.0 or later is required."
 
 require 'json'
+require 'shellwords'
 require 'time'
 require 'uri'
 require 'yaml'
@@ -99,6 +100,21 @@ urls:
       #       type: regexp
       #       pattern: |-
       #         \S@(?=\S)(?~@my\.compan\.y)$
+  open:
+    # Define how to open each URL.  First match wins.
+    #
+    # Open URLs from company calendars with Chrome using the second profile.
+    # - with: |-
+    #     /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --profile-directory='Profile 1' -g %s
+    #   if:
+    #     - calendar: me@my.compan.y
+    #       url:
+    #         type: regexp
+    #         pattern: |-
+    #           ^https?://
+    # This is the default.
+    # - with: |-
+    #     open -g %s
     EOF
   end
 
@@ -284,6 +300,40 @@ def get_events(calendars, argv, &event_in_range_p)
   end
 
   events
+end
+
+def get_opener_func
+  opener_funcs = Array(configuration[:open]).map { |open_hash|
+    open_hash => with: command_template
+
+    if open_hash in if: if_hashes
+      patterns = Array(if_hashes).map { |if_hash|
+        compile_event_pattern(if_hash)
+      }
+
+      ->(url, event) {
+        command_template if patterns.any? { |hash|
+          case hash
+          in { url: url_pattern, **rest }
+            url_pattern === url && event_match?(event, rest)
+          else
+            event_match?(event, hash)
+          end
+        }
+      }
+    else
+      ->(url, event) { command_template }
+    end
+  }
+
+  ->(url, event) {
+    opener_funcs.each do |func|
+      if command_template = func.call(url, event)
+        return command_template
+      end
+    end
+    'open -g %s'
+  }
 end
 
 def main
@@ -533,8 +583,12 @@ followed by icalBuddy options:
   end
 
   if open_urls
-    events.flat_map { |event| event[:urls] }.each do |url|
-      system 'open', '-g', url
+    opener = get_opener_func
+
+    events.each do |event|
+      event[:urls].each do |url|
+        system(opener.call(url, event) % url.shellescape)
+      end
     end
   end
 
