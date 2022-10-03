@@ -208,7 +208,7 @@ def event_match?(event, hash)
   end
 
   if hash in { notes: }
-    title === event.notes or return false
+    notes === event.notes or return false
   end
 
   if hash in { url: }
