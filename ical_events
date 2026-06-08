@@ -36,6 +36,7 @@
 RUBY_VERSION >= '3.0' or abort "Ruby 3.0 or later is required."
 
 require 'json'
+require 'open3'
 require 'shellwords'
 require 'time'
 require 'uri'
@@ -149,18 +150,32 @@ def compile_event_pattern(hash)
   }
 end
 
-class Calendar < Struct.new(
+class JsonStruct < Struct
+  def as_json
+    to_h.transform_values { |v|
+      case v
+      when Time, Date
+        v.iso8601
+      else
+        v
+      end
+    }
+  end
+
+  def to_json(*a)
+    as_json.to_json(*a)
+  end
+end
+
+class Calendar < JsonStruct.new(
   :title,
   :type,
   :uid,
   keyword_init: true
 )
-  def to_json(*a)
-    to_h.to_json(*a)
-  end
 end
 
-class Event < Struct.new(
+class Event < JsonStruct.new(
   :title,
   :calendar,
   :start_at,
@@ -181,17 +196,25 @@ class Event < Struct.new(
       false
     end
   end
+end
 
-  def to_json(*a)
-    to_h.transform_values! { |v|
-      case v
-      when Time, Date
-        v.iso8601
-      else
-        v
-      end
-    }.to_json(*a)
-  end
+class Reminder < JsonStruct.new(
+  :title,
+  :list,
+  :calendar,
+  :completed,
+  :due_at,
+  :due_on,
+  :remind_at,
+  :priority,
+  :attendees,
+  :location,
+  :notes,
+  :url,
+  :urls,
+  :id,
+  keyword_init: true
+)
 end
 
 def event_match?(event, hash)
@@ -212,7 +235,7 @@ def event_match?(event, hash)
   end
 
   if hash in { url: }
-    event.urls.any?(url) or return false
+    Array(event.urls).any?(url) or return false
   end
 
   if hash in { attendee: }
@@ -302,6 +325,198 @@ def get_events(calendars, argv, &event_in_range_p)
   events
 end
 
+REMINDERS_SWIFT = <<~'SWIFT'
+import Dispatch
+import EventKit
+import Foundation
+
+let store = EKEventStore()
+let accessSemaphore = DispatchSemaphore(value: 0)
+var granted = false
+
+if #available(macOS 14.0, *) {
+  store.requestFullAccessToReminders { ok, _ in
+    granted = ok
+    accessSemaphore.signal()
+  }
+} else {
+  store.requestAccess(to: .reminder) { ok, _ in
+    granted = ok
+    accessSemaphore.signal()
+  }
+}
+accessSemaphore.wait()
+
+if !granted {
+  fputs("reminders access denied\n", stderr)
+  exit(1)
+}
+
+let formatter = ISO8601DateFormatter()
+
+func iso8601(_ date: Date?) -> Any {
+  guard let date else { return NSNull() }
+  return formatter.string(from: date)
+}
+
+func value(_ string: String?) -> Any {
+  string ?? ""
+}
+
+let predicate = store.predicateForReminders(in: nil)
+let fetchSemaphore = DispatchSemaphore(value: 0)
+var rows: [[String: Any]] = []
+
+store.fetchReminders(matching: predicate) { reminders in
+  rows = (reminders ?? []).filter { !$0.isCompleted }.map { reminder in
+    let dueDate = reminder.dueDateComponents?.date
+    let remindDate = reminder.alarms?.compactMap(\.absoluteDate).min()
+
+    return [
+      "title": value(reminder.title),
+      "list": value(reminder.calendar.title),
+      "calendar": value(reminder.calendar.title),
+      "completed": reminder.isCompleted,
+      "due_at": iso8601(dueDate),
+      "remind_at": iso8601(remindDate),
+      "priority": reminder.priority,
+      "notes": value(reminder.notes),
+      "url": reminder.url?.absoluteString ?? "",
+      "urls": [],
+      "id": reminder.calendarItemIdentifier,
+    ]
+  }
+  fetchSemaphore.signal()
+}
+fetchSemaphore.wait()
+
+let data = try JSONSerialization.data(withJSONObject: rows, options: [])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+
+def get_reminders
+  json, err, status = Open3.capture3("swift", "-e", REMINDERS_SWIFT)
+  status.success? or abort err
+
+  reminders = JSON.parse(json, symbolize_names: true).map { |hash|
+    due_at = Time.parse(hash[:due_at]) if hash[:due_at]
+    remind_at = Time.parse(hash[:remind_at]) if hash[:remind_at]
+
+    Reminder.new(
+      title: hash[:title],
+      list: hash[:list],
+      calendar: hash[:calendar],
+      completed: hash[:completed],
+      due_at: due_at,
+      due_on: due_at&.to_date,
+      remind_at: remind_at,
+      priority: hash[:priority],
+      attendees: nil,
+      location: nil,
+      notes: hash[:notes],
+      url: hash[:url],
+      urls: hash[:urls],
+      id: hash[:id]
+    )
+  }
+
+  add_reminder_urls_from_store(reminders)
+  reminders
+end
+
+def add_reminder_urls_from_store(reminders)
+  ids = reminders.map { |reminder| reminder.id.delete("-").upcase }
+  urls_by_id = reminder_urls_from_store(ids)
+
+  reminders.each do |reminder|
+    urls = urls_by_id[reminder.id.delete("-").upcase] || []
+    reminder[:url] = urls.first || (reminder.url unless reminder.url&.empty?)
+    reminder[:urls] = [*reminder.urls, *urls].uniq
+  end
+end
+
+def reminder_urls_from_store(ids)
+  return {} if ids.empty?
+
+  store_dir = File.expand_path("~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores")
+  stores = reminder_store_paths(store_dir)
+  if stores.empty?
+    $stderr.puts "No Reminders store files were found in #{store_dir}."
+    return {}
+  end
+
+  quoted_ids = ids.map { |id| "'#{id}'" }.join(",")
+  query = <<~SQL
+    select upper(hex(r.ZIDENTIFIER)), coalesce(r.ZICSURL, ''), coalesce(o.ZURL, '')
+    from ZREMCDREMINDER r
+    left join ZREMCDOBJECT o
+      on o.ZREMINDER = r.Z_PK
+      or o.ZREMINDER1 = r.Z_PK
+      or o.ZREMINDER2 = r.Z_PK
+      or o.ZREMINDER3 = r.Z_PK
+      or o.ZREMINDER4 = r.Z_PK
+      or o.ZREMINDER5 = r.Z_PK
+    where r.ZCOMPLETED = 0
+      and upper(hex(r.ZIDENTIFIER)) in (#{quoted_ids})
+  SQL
+  urls_by_id = Hash.new { |hash, key| hash[key] = [] }
+
+  stores.each do |db|
+    output, err, status = Open3.capture3(
+      "sqlite3",
+      "-separator", "\x1f",
+      "-newline", "\x1e",
+      db,
+      query
+    )
+    unless status.success?
+      $stderr.puts err
+      request_full_disk_access("sqlite3 failed while reading the Reminders store.")
+      return urls_by_id.transform_values!(&:uniq)
+    end
+
+    output.split("\x1e").each do |line|
+      id, *urls = line.split("\x1f", -1)
+      next if id.nil? || id.empty?
+
+      urls_by_id[id].concat(urls.grep(RE_URL))
+    end
+  rescue Errno::ENOENT
+    break
+  end
+
+  urls_by_id.transform_values!(&:uniq)
+rescue Errno::EPERM => e
+  request_full_disk_access("EPERM while listing the Reminders store: #{e.message}")
+  {}
+end
+
+def reminder_store_paths(store_dir)
+  Dir.glob("#{store_dir}/Data-*.sqlite")
+end
+
+def request_full_disk_access(reason)
+  message = [
+    reason,
+    "Grant Full Disk Access to the app running #{File.basename($0)}.",
+  ].join("\n")
+  $stderr.puts message
+  show_full_disk_access_alert(message)
+  open_full_disk_access_settings
+end
+
+def show_full_disk_access_alert(message)
+  system(
+    "osascript",
+    "-e",
+    "display alert #{message.dump} as warning buttons {\"OK\"} default button \"OK\""
+  )
+end
+
+def open_full_disk_access_settings
+  system("open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+end
+
 def get_opener_func
   opener_funcs = Array(configuration[:open]).map { |open_hash|
     open_hash => with: command_template
@@ -336,87 +551,12 @@ def get_opener_func
   }
 end
 
-def main
-  verbose = false
-  start_at_range = nil
-  open_urls = false
-
-  myname = File.basename($0)
-
+def require_icalbuddy(myname)
   Process.wait2(spawn("type icalBuddy", err: IO::NULL, out: IO::NULL))[1].success? or
     abort "#{myname}: icalBuddy must be installed.  To install it via Homebrew, run `brew install ical-buddy`."
+end
 
-  until ARGV.empty?
-    if ARGV.delete("-V")
-      system("icalBuddy -V")
-      exit
-    end
-
-    # JSON is our output format and fancy output breaks parsing.
-    ARGV.delete("-f")
-
-    case ARGV.first
-    when '--edit-config'
-      edit_configuration
-      exit
-    when '--help'
-      print IO.popen("icalBuddy --help", &:read)
-        .sub!(/^USAGE: \KicalBuddy/, myname)
-        .sub!(/^<command>.*$/) { $& + " (default: eventsNow)" }
-        .sub!(/^( +'eventsNow'\s+.*\n)/) { $& + <<-EOS }
-  'eventsInMinutes:NUM'
-                     Print events occurring in N minutes (#{myname} feature)
-        EOS
-        .sub!(/^Some .*\n/, <<-EOS)
-ical_events specific [options] must come first:
-
---edit-config
-            Edit the configuration file, creating one if not
---open-urls Open URLs in matching events via open(1)
---verbose   Print additional information to stderr
-
-followed by icalBuddy options:
-        EOS
-        .sub!(/^-[A-Za-z].*\n(?=\n)/) { $& + <<-EOS }
-
-#{myname} prints out events in JSON, so among others, formatting options do not work with ical_events.
-        EOS
-      exit
-    when '--open-urls'
-      open_urls = true
-    when '--verbose'
-      verbose = true
-    when 'calendars'
-      puts JSON.pretty_generate(get_calendars)
-      exit
-    else
-      break
-    end
-
-    ARGV.shift
-  end
-
-  argv =
-    if ARGV.empty?
-      %w[eventsNow]
-    else
-      ARGV.flat_map { |arg|
-        case arg
-        when /\AeventsInMinutes:(-?\d+)\z/
-          now = Time.now
-          minutes = $1.to_i
-          from, to = [now, now + minutes * 60].sort
-          start_at_range = from...to
-          [
-            "eventsFrom:" + from.strftime(TIME_FORMAT),
-            "to:" + to.strftime(TIME_FORMAT),
-          ]
-        else
-          arg
-        end
-      }
-    end
-
+def urls_configuration
   urls_ignore = Array(configuration.dig(:urls, :ignore)).map { |hash|
     compile_event_pattern(hash)
   }
@@ -434,34 +574,10 @@ followed by icalBuddy options:
     }
   } || {}
 
-  re_calendar_name =
-    if (patterns = Array(configuration.dig(:calendars))).size > 0
-      patterns.map { |pattern|
-        pattern_to_regexp(pattern)
-      }.then { |res| Regexp.union(*res) }
-    else
-      //
-    end
+  [urls_ignore, urls_account]
+end
 
-  calendars = get_calendars.select { |calendar|
-    re_calendar_name.match?(calendar.title)
-  }
-
-  if verbose
-    $stderr.puts "Checking #{calendars.size} calendars:"
-    calendars.each do |calendar|
-      $stderr.puts "- #{calendar.title}"
-    end
-  end
-
-  events = get_events(calendars, argv) { |event|
-    if start_at_range
-      event.start_in_range?(start_at_range)
-    else
-      true
-    end
-  }
-
+def add_urls(events, urls_ignore, urls_account)
   account_for_event = -> (event, account_type) {
     urls_account[account_type]&.each_pair do |account, patterns|
       if patterns.any? { |pattern| event_match?(event, pattern) }
@@ -473,12 +589,14 @@ followed by icalBuddy options:
   }
 
   events.each do |event|
-    event[:attendees] &&= event[:attendees].split(', ')
+    event[:attendees] &&= event[:attendees].split(', ') if event[:attendees].is_a?(String)
 
     urls = [
       *event[:url]&.scan(RE_URL),
+      *event[:title]&.scan(RE_URL),
       *event[:location]&.scan(RE_URL),
       *event[:notes]&.scan(RE_URL),
+      *event[:urls],
     ].reject { |url|
       urls_ignore.any? { |hash|
         case hash
@@ -581,16 +699,165 @@ followed by icalBuddy options:
 
     event[:urls] = [*meeting_uri, *other_uris].uniq.map(&:to_s)
   end
+end
 
-  if open_urls
-    opener = get_opener_func
+def open_event_urls(events)
+  opener = get_opener_func
 
-    events.each do |event|
-      event[:urls].each do |url|
-        system(opener.call(url, event) % url.shellescape)
-      end
+  events.each do |event|
+    event[:urls].each do |url|
+      system(opener.call(url, event) % url.shellescape)
     end
   end
+end
+
+def main
+  verbose = false
+  start_at_range = nil
+  open_urls = false
+
+  myname = File.basename($0)
+
+  until ARGV.empty?
+    if ARGV.delete("-V")
+      system("icalBuddy -V")
+      exit
+    end
+
+    # JSON is our output format and fancy output breaks parsing.
+    ARGV.delete("-f")
+
+    case ARGV.first
+    when '--edit-config'
+      edit_configuration
+      exit
+    when '--help'
+      stdout, stderr, = Open3.capture3("icalBuddy", "--help")
+      help = stdout + stderr
+      if help.empty?
+        puts <<~EOS
+        USAGE: #{myname} [options] [<command>] [icalBuddy options]
+
+        ical_events specific [options] must come first:
+
+        --edit-config
+                    Edit the configuration file, creating one if not
+        --open-urls Open URLs in matching events via open(1)
+        --verbose   Print additional information to stderr
+
+        Commands:
+
+          eventsNow
+                     Print current events (default)
+          eventsInMinutes:NUM
+                     Print events occurring in N minutes
+          reminders
+                     Print incomplete reminders containing URLs
+        EOS
+        exit
+      end
+      help.sub!(/^USAGE: \KicalBuddy/, myname)
+      help.sub!(/^<command>.*$/) { $& + " (default: eventsNow)" }
+      help.sub!(/^( +'eventsNow'\s+.*\n)/) { $& + <<-EOS }
+  'eventsInMinutes:NUM'
+                     Print events occurring in N minutes (#{myname} feature)
+  'reminders'
+                     Print incomplete reminders containing URLs (#{myname} feature)
+        EOS
+      help.sub!(/^Some .*\n/, <<-EOS)
+ical_events specific [options] must come first:
+
+--edit-config
+            Edit the configuration file, creating one if not
+--open-urls Open URLs in matching events via open(1)
+--verbose   Print additional information to stderr
+
+followed by icalBuddy options:
+        EOS
+      help.sub!(/^-[A-Za-z].*\n\n/) { $& + <<-EOS }
+#{myname} prints out events in JSON, so among others, formatting options do not work with ical_events.
+
+        EOS
+      print help
+      exit
+    when '--open-urls'
+      open_urls = true
+    when '--verbose'
+      verbose = true
+    when 'calendars'
+      require_icalbuddy(myname)
+      puts JSON.pretty_generate(get_calendars)
+      exit
+    when 'reminders'
+      ARGV.shift
+      urls_ignore, urls_account = urls_configuration
+      reminders = get_reminders
+      add_urls(reminders, urls_ignore, urls_account)
+      open_event_urls(reminders) if open_urls
+      puts JSON.pretty_generate(reminders)
+      exit
+    else
+      break
+    end
+
+    ARGV.shift
+  end
+
+  argv =
+    if ARGV.empty?
+      %w[eventsNow]
+    else
+      ARGV.flat_map { |arg|
+        case arg
+        when /\AeventsInMinutes:(-?\d+)\z/
+          now = Time.now
+          minutes = $1.to_i
+          from, to = [now, now + minutes * 60].sort
+          start_at_range = from...to
+          [
+            "eventsFrom:" + from.strftime(TIME_FORMAT),
+            "to:" + to.strftime(TIME_FORMAT),
+          ]
+        else
+          arg
+        end
+      }
+    end
+
+  urls_ignore, urls_account = urls_configuration
+
+  require_icalbuddy(myname)
+
+  re_calendar_name =
+    if (patterns = Array(configuration.dig(:calendars))).size > 0
+      Regexp.union(patterns.map { |pattern|
+        pattern_to_regexp(pattern)
+      })
+    else
+      //
+    end
+
+  calendars = get_calendars.select { |calendar|
+    re_calendar_name.match?(calendar.title)
+  }
+
+  if verbose
+    $stderr.puts "Checking #{calendars.size} calendars:"
+    calendars.each do |calendar|
+      $stderr.puts "- #{calendar.title}"
+    end
+  end
+
+  events = get_events(calendars, argv) { |event|
+    if start_at_range
+      event.start_in_range?(start_at_range)
+    else
+      true
+    end
+  }
+
+  add_urls(events, urls_ignore, urls_account)
+  open_event_urls(events) if open_urls
 
   puts JSON.pretty_generate(events)
 end
