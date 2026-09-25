@@ -712,21 +712,23 @@ def open_event_urls(events)
 end
 
 def main
-  verbose = false
   start_at_range = nil
-  open_urls = false
 
   myname = File.basename($0)
 
+  if ARGV.delete("-V")
+    system("icalBuddy -V")
+    exit
+  end
+
+  # JSON is our output format and fancy output breaks parsing.
+  ARGV.delete("-f")
+
+  # These flags are ours, not icalBuddy's, so accept them anywhere.
+  open_urls = !ARGV.delete("--open-urls").nil?
+  verbose = !ARGV.delete("--verbose").nil?
+
   until ARGV.empty?
-    if ARGV.delete("-V")
-      system("icalBuddy -V")
-      exit
-    end
-
-    # JSON is our output format and fancy output breaks parsing.
-    ARGV.delete("-f")
-
     case ARGV.first
     when '--edit-config'
       edit_configuration
@@ -738,7 +740,7 @@ def main
         puts <<~EOS
         USAGE: #{myname} [options] [<command>] [icalBuddy options]
 
-        ical_events specific [options] must come first:
+        ical_events specific [options] (--open-urls and --verbose may appear anywhere):
 
         --edit-config
                     Edit the configuration file, creating one if not
@@ -765,7 +767,7 @@ def main
                      Print incomplete reminders containing URLs (#{myname} feature)
         EOS
       help.sub!(/^Some .*\n/, <<-EOS)
-ical_events specific [options] must come first:
+ical_events specific [options] (--open-urls and --verbose may appear anywhere):
 
 --edit-config
             Edit the configuration file, creating one if not
@@ -780,10 +782,6 @@ followed by icalBuddy options:
         EOS
       print help
       exit
-    when '--open-urls'
-      open_urls = true
-    when '--verbose'
-      verbose = true
     when 'calendars'
       require_icalbuddy(myname)
       puts JSON.pretty_generate(get_calendars)
