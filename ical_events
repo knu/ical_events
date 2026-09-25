@@ -282,6 +282,8 @@ def get_events(calendars, argv, &event_in_range_p)
       when /\A#{Regexp.quote(BULLET)} (.+) \((#{Regexp.union(calendars.map(&:title))})\)\z/o
         events << event if event && event_in_range_p.call(event)
         event = Event.new(title: $1, calendar: $2)
+      when /\A\S/
+        abort "#{File.basename($0)}: unexpected output from icalBuddy: #{line}"
       when /\A    (\w+): (.+)/
         last_prop = $1.to_sym
         event[last_prop] = $2
