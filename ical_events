@@ -703,14 +703,20 @@ def add_urls(events, urls_ignore, urls_account)
   end
 end
 
+# Returns false if any opener command fails, after warning about each failure.
 def open_event_urls(events)
   opener = get_opener_func
+  myname = File.basename($0)
 
-  events.each do |event|
-    event[:urls].each do |url|
-      system(opener.call(url, event) % url.shellescape)
-    end
-  end
+  events.flat_map { |event|
+    event[:urls].map { |url|
+      command = opener.call(url, event) % url.shellescape
+      next true if system(command)
+
+      $stderr.puts "#{myname}: failed to open #{url}: #{command}"
+      false
+    }
+  }.all?
 end
 
 def main
@@ -793,9 +799,9 @@ followed by icalBuddy options:
       urls_ignore, urls_account = urls_configuration
       reminders = get_reminders
       add_urls(reminders, urls_ignore, urls_account)
-      open_event_urls(reminders) if open_urls
+      opened = !open_urls || open_event_urls(reminders)
       puts JSON.pretty_generate(reminders)
-      exit
+      exit opened
     else
       break
     end
@@ -857,9 +863,10 @@ followed by icalBuddy options:
   }
 
   add_urls(events, urls_ignore, urls_account)
-  open_event_urls(events) if open_urls
+  opened = !open_urls || open_event_urls(events)
 
   puts JSON.pretty_generate(events)
+  exit opened
 end
 
 main
