@@ -44,7 +44,7 @@ You may also need to manually give `/usr/sbin/cron` Full Disk Access and possibl
 
 ## Author
 
-Copyright (c) 2021-2022 Akinori MUSHA.
+Copyright (c) 2021-2026 Akinori MUSHA.
 
 Licensed under the 2-clause BSD license.  See `LICENSE.txt` for
 details.
