@@ -6,6 +6,14 @@ It converts the output from icalBuddy to JSON to help process your events as dat
 
 ical_events tries to avoid opening multiple meeting URLs that typically occur in Google Calendar thanks to the default Google Meet links and Zoom for GSuite Add-On.  It also has configurable options like urls.ignore and urls.account.google/zoom so you can filter and alter URLs to open in a fine-grained manner.  See the example configuration file (use `--edit-config` below) for details.
 
+## Installation
+
+```sh
+mise use -g github:knu/ical_events@latest
+```
+
+Ruby 3.0 or later and icalBuddy must be available on `PATH`; see Requirements below.
+
 ## Usage
 
 ``` shellsession
