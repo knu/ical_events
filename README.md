@@ -26,6 +26,16 @@ Ruby 3.0 or later and icalBuddy must be available on `PATH`; see Requirements be
 % ical_events --open-urls eventsInMinutes:1
 ```
 
+Use `--jq EXPR` to select events or reminders for this invocation.  The expression runs on each item after URL processing and before opening URLs.  Only items for which it produces a truthy value (anything other than `false` or `null`) are printed and opened.  An expression that produces no values excludes the item; if it produces several values, any truthy value keeps the item.
+
+``` shellsession
+% ical_events --open-urls eventsNow --jq '.title != "Skip"'
+
+% ical_events reminders --jq '.calendar != "Personal"'
+```
+
+`--jq` requires jq on `PATH` (`brew install jq`).  A jq error stops processing before any URLs are opened.
+
 ## Requirements
 
 - macOS

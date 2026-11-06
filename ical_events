@@ -703,6 +703,21 @@ def add_urls(events, urls_ignore, urls_account)
   end
 end
 
+def filter_events(events, expression)
+  return events unless expression
+
+  json, err, status = Open3.capture3(
+    "jq", "-c", "--", "map([ (#{expression}) ] | any)",
+    stdin_data: JSON.generate(events)
+  )
+  status.success? or abort "#{File.basename($0)}: --jq: #{err.strip}"
+
+  matches = JSON.parse(json)
+  events.zip(matches).filter_map { |event, match| event if match }
+rescue Errno::ENOENT
+  abort "#{File.basename($0)}: --jq requires jq on PATH."
+end
+
 # Returns false if any opener command fails, after warning about each failure.
 def open_event_urls(events)
   opener = get_opener_func
@@ -723,6 +738,12 @@ def main
   start_at_range = nil
 
   myname = File.basename($0)
+
+  jq_expression = nil
+  while index = ARGV.index("--jq")
+    _, jq_expression = ARGV.slice!(index, 2)
+    jq_expression or abort "#{myname}: --jq requires an expression."
+  end
 
   if ARGV.delete("-V")
     system("icalBuddy -V")
@@ -748,11 +769,12 @@ def main
         puts <<~EOS
         USAGE: #{myname} [options] [<command>] [icalBuddy options]
 
-        ical_events specific [options] (--open-urls and --verbose may appear anywhere):
+        ical_events specific [options] (--open-urls, --jq and --verbose may appear anywhere):
 
         --edit-config
                     Edit the configuration file, creating one if not
         --open-urls Open URLs in matching events via open(1)
+        --jq EXPR   Keep events/reminders where EXPR yields a truthy value
         --verbose   Print additional information to stderr
 
         Commands:
@@ -775,11 +797,12 @@ def main
                      Print incomplete reminders containing URLs (#{myname} feature)
         EOS
       help.sub!(/^Some .*\n/, <<-EOS)
-ical_events specific [options] (--open-urls and --verbose may appear anywhere):
+ical_events specific [options] (--open-urls, --jq and --verbose may appear anywhere):
 
 --edit-config
             Edit the configuration file, creating one if not
 --open-urls Open URLs in matching events via open(1)
+--jq EXPR   Keep events/reminders where EXPR yields a truthy value
 --verbose   Print additional information to stderr
 
 followed by icalBuddy options:
@@ -799,6 +822,7 @@ followed by icalBuddy options:
       urls_ignore, urls_account = urls_configuration
       reminders = get_reminders
       add_urls(reminders, urls_ignore, urls_account)
+      reminders = filter_events(reminders, jq_expression)
       opened = !open_urls || open_event_urls(reminders)
       puts JSON.pretty_generate(reminders)
       exit opened
@@ -863,10 +887,11 @@ followed by icalBuddy options:
   }
 
   add_urls(events, urls_ignore, urls_account)
+  events = filter_events(events, jq_expression)
   opened = !open_urls || open_event_urls(events)
 
   puts JSON.pretty_generate(events)
   exit opened
 end
 
-main
+main if $PROGRAM_NAME == __FILE__
